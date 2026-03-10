@@ -5,9 +5,6 @@ import { runProcess } from "./processRunner";
 
 const MAX_DYNAMIC_TOOL_RESULTS = 200;
 const DEFAULT_DYNAMIC_TOOL_RESULTS = 20;
-const DEFAULT_READ_FILE_BYTES = 256 * 1024;
-const MAX_READ_FILE_BYTES = 512 * 1024;
-const DEFAULT_AROUND_LINE_COUNT = 40;
 
 interface DynamicToolTextContent {
   readonly type: "input_text";
@@ -43,9 +40,6 @@ interface ReadFileRequest {
   readonly path: string;
   readonly startLine?: number;
   readonly endLine?: number;
-  readonly aroundLine?: number;
-  readonly lineCount?: number;
-  readonly maxBytes?: number;
 }
 
 interface ReadFilesArgs {
@@ -80,7 +74,7 @@ const DYNAMIC_TOOL_DEFINITIONS: ReadonlyArray<CodexDynamicToolDefinition> = [
     name: "read_files",
     description: "Batch-read UTF-8 text files. Prefer batching related files in one call.",
     instructionExample:
-      '{"requests":[{"path": string, "startLine"?: number, "endLine"?: number, "aroundLine"?: number, "lineCount"?: number, "maxBytes"?: number}, ...]}',
+      '{"requests":[{"path": string, "startLine"?: number, "endLine"?: number}, ...]}',
     inputSchema: {
       type: "object",
       properties: {
@@ -93,9 +87,6 @@ const DYNAMIC_TOOL_DEFINITIONS: ReadonlyArray<CodexDynamicToolDefinition> = [
               path: { type: "string" },
               startLine: { type: "integer", minimum: 1 },
               endLine: { type: "integer", minimum: 1 },
-              aroundLine: { type: "integer", minimum: 1 },
-              lineCount: { type: "integer", minimum: 1 },
-              maxBytes: { type: "integer", minimum: 1 },
             },
             required: ["path"],
             additionalProperties: false,
@@ -166,10 +157,6 @@ function clampMaxResults(value: number | undefined): number {
   return clampCount(value, DEFAULT_DYNAMIC_TOOL_RESULTS, MAX_DYNAMIC_TOOL_RESULTS);
 }
 
-function clampReadBytes(value: number | undefined): number {
-  return clampCount(value, DEFAULT_READ_FILE_BYTES, MAX_READ_FILE_BYTES);
-}
-
 function toPosixPath(value: string): string {
   return value.split(path.sep).join("/");
 }
@@ -229,17 +216,11 @@ function parseReadFileRequest(value: unknown): ReadFileRequest | undefined {
 
   const startLine = asSafeInteger(record.startLine);
   const endLine = asSafeInteger(record.endLine);
-  const aroundLine = asSafeInteger(record.aroundLine);
-  const lineCount = asSafeInteger(record.lineCount);
-  const maxBytes = asSafeInteger(record.maxBytes);
 
   return {
     path: filePath,
     ...(startLine !== undefined ? { startLine } : {}),
     ...(endLine !== undefined ? { endLine } : {}),
-    ...(aroundLine !== undefined ? { aroundLine } : {}),
-    ...(lineCount !== undefined ? { lineCount } : {}),
-    ...(maxBytes !== undefined ? { maxBytes } : {}),
   };
 }
 
@@ -366,19 +347,8 @@ function computeReadWindow(totalLines: number, request: ReadFileRequest): { star
     return { start: 1, end: 0 };
   }
 
-  if (request.aroundLine !== undefined) {
-    const count = request.lineCount ?? DEFAULT_AROUND_LINE_COUNT;
-    const clampedCount = Math.max(1, count);
-    const center = Math.max(1, Math.min(request.aroundLine, totalLines));
-    let start = Math.max(1, center - Math.floor((clampedCount - 1) / 2));
-    let end = Math.min(totalLines, start + clampedCount - 1);
-    start = Math.max(1, end - clampedCount + 1);
-    return { start, end };
-  }
-
   const start = Math.max(1, Math.min(request.startLine ?? 1, totalLines));
-  const requestedEnd =
-    request.endLine ?? (request.lineCount !== undefined ? start + request.lineCount - 1 : totalLines);
+  const requestedEnd = request.endLine ?? totalLines;
   const end = Math.max(start, Math.min(requestedEnd, totalLines));
   return { start, end };
 }
@@ -395,18 +365,7 @@ async function readWorkspaceFiles(args: ReadFilesArgs, cwd: string): Promise<Cod
   for (const request of args.requests) {
     try {
       const workspacePath = resolveWorkspacePath(cwd, request.path);
-      const maxBytes = clampReadBytes(request.maxBytes);
-      const buffer = await fs.readFile(workspacePath.absolutePath);
-      const binary = buffer.includes(0);
-      const truncated = buffer.length > maxBytes;
-      const visibleBuffer = truncated ? buffer.subarray(0, maxBytes) : buffer;
-
-      if (binary) {
-        sections.push(`FILE ${workspacePath.displayPath}\nBINARY true\nSIZE_BYTES ${buffer.length}`);
-        continue;
-      }
-
-      const text = visibleBuffer.toString("utf8");
+      const text = await fs.readFile(workspacePath.absolutePath, "utf8");
       const allLines = text.split(/\r?\n/u);
       const totalLines = allLines.length;
       const window = computeReadWindow(totalLines, request);
@@ -418,7 +377,6 @@ async function readWorkspaceFiles(args: ReadFilesArgs, cwd: string): Promise<Cod
           `FILE ${workspacePath.displayPath}`,
           `LINES ${window.start}-${window.end}`,
           `TOTAL_LINES ${totalLines}`,
-          `TRUNCATED ${truncated}`,
           renderReadSection(selectedLines, window.start),
         ]
           .filter((entry) => entry.length > 0)
