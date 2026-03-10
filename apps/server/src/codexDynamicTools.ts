@@ -3,9 +3,6 @@ import path from "node:path";
 
 import { runProcess } from "./processRunner";
 
-const MAX_DYNAMIC_TOOL_RESULTS = 200;
-const DEFAULT_DYNAMIC_TOOL_RESULTS = 20;
-
 interface DynamicToolTextContent {
   readonly type: "input_text";
   readonly text: string;
@@ -31,9 +28,6 @@ interface CodexDynamicToolDefinition extends CodexDynamicToolSpec {
 interface SearchWorkspaceArgs {
   readonly query: string;
   readonly mode: "path" | "content";
-  readonly glob?: string;
-  readonly caseSensitive?: boolean;
-  readonly maxResults?: number;
 }
 
 interface ReadFileRequest {
@@ -55,16 +49,12 @@ const DYNAMIC_TOOL_DEFINITIONS: ReadonlyArray<CodexDynamicToolDefinition> = [
   {
     name: "search_workspace",
     description: "Fast workspace search by path or content.",
-    instructionExample:
-      '{"query": string, "mode": "path" | "content", "glob"?: string, "caseSensitive"?: boolean, "maxResults"?: number}',
+    instructionExample: '{"query": string, "mode": "path" | "content"}',
     inputSchema: {
       type: "object",
       properties: {
         query: { type: "string" },
         mode: { type: "string", enum: ["path", "content"] },
-        glob: { type: "string" },
-        caseSensitive: { type: "boolean" },
-        maxResults: { type: "integer", minimum: 1 },
       },
       required: ["query", "mode"],
       additionalProperties: false,
@@ -138,35 +128,12 @@ function asString(value: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
 }
 
-function asBoolean(value: unknown): boolean | undefined {
-  return typeof value === "boolean" ? value : undefined;
-}
-
 function asSafeInteger(value: unknown): number | undefined {
   return typeof value === "number" && Number.isSafeInteger(value) ? value : undefined;
 }
 
-function clampCount(value: number | undefined, fallback: number, max: number): number {
-  if (value === undefined) {
-    return fallback;
-  }
-  return Math.max(1, Math.min(value, max));
-}
-
-function clampMaxResults(value: number | undefined): number {
-  return clampCount(value, DEFAULT_DYNAMIC_TOOL_RESULTS, MAX_DYNAMIC_TOOL_RESULTS);
-}
-
 function toPosixPath(value: string): string {
   return value.split(path.sep).join("/");
-}
-
-function normalizeDisplayPath(value: string): string {
-  let normalized = value;
-  while (normalized.startsWith("././")) {
-    normalized = normalized.slice(2);
-  }
-  return normalized;
 }
 
 function formatToolTextResult(text: string): CodexDynamicToolResult {
@@ -194,16 +161,9 @@ function parseSearchWorkspaceArgs(value: unknown): SearchWorkspaceArgs | undefin
     return undefined;
   }
 
-  const glob = asString(record.glob);
-  const caseSensitive = asBoolean(record.caseSensitive);
-  const maxResults = asSafeInteger(record.maxResults);
-
   return {
     query,
     mode,
-    ...(glob ? { glob } : {}),
-    ...(caseSensitive !== undefined ? { caseSensitive } : {}),
-    ...(maxResults !== undefined ? { maxResults } : {}),
   };
 }
 
@@ -253,7 +213,7 @@ function resolveWorkspacePath(cwd: string, requestedPath: string): WorkspacePath
 
   return {
     absolutePath,
-    displayPath: normalizeDisplayPath(toPosixPath(relativePath)),
+    displayPath: toPosixPath(relativePath),
   };
 }
 
@@ -262,25 +222,20 @@ async function searchWorkspacePaths(
   cwd: string,
 ): Promise<CodexDynamicToolResult> {
   const rgArgs = ["--files"];
-  if (args.glob) {
-    rgArgs.push("-g", args.glob);
-  }
-
   const result = await runProcess("rg", rgArgs, {
     cwd,
     allowNonZeroExit: true,
   });
-  const query = args.caseSensitive ? args.query : args.query.toLowerCase();
+  const query = args.query.toLowerCase();
   const matchingPaths = result.stdout
     .split(/\r?\n/u)
     .map((entry) => entry.trim())
     .filter((entry) => entry.length > 0)
     .filter((entry) => {
-      const candidate = args.caseSensitive ? entry : entry.toLowerCase();
-      return candidate.includes(query);
+      return entry.toLowerCase().includes(query);
     })
-    .slice(0, clampMaxResults(args.maxResults))
-    .map((entry) => normalizeDisplayPath(toPosixPath(entry)));
+    .slice(0, 50)
+    .map(toPosixPath);
 
   if (matchingPaths.length === 0) {
     return formatToolTextResult("No path matches found.");
@@ -293,14 +248,7 @@ async function searchWorkspaceContent(
   args: SearchWorkspaceArgs,
   cwd: string,
 ): Promise<CodexDynamicToolResult> {
-  const rgArgs = ["--color", "never", "--line-number", "--no-heading"];
-  if (!args.caseSensitive) {
-    rgArgs.push("-i");
-  }
-  if (args.glob) {
-    rgArgs.push("-g", args.glob);
-  }
-  rgArgs.push(args.query, ".");
+  const rgArgs = ["--color", "never", "--line-number", "--no-heading", "-i", args.query];
 
   const result = await runProcess("rg", rgArgs, {
     cwd,
@@ -313,7 +261,7 @@ async function searchWorkspaceContent(
     .split(/\r?\n/u)
     .map((line) => line.trimEnd())
     .filter((line) => line.length > 0)
-    .slice(0, clampMaxResults(args.maxResults))
+    .slice(0, 50)
     .map((line) => {
       const match = /^(.*?):(\d+):(.*)$/u.exec(line);
       if (!match) {
@@ -327,7 +275,7 @@ async function searchWorkspaceContent(
       }
 
       return {
-        path: normalizeDisplayPath(toPosixPath(matchedPath)),
+        path: toPosixPath(matchedPath),
         line: Number.parseInt(matchedLine, 10),
         preview: match[3] ?? "",
       };
@@ -400,7 +348,7 @@ export async function executeCodexDynamicTool(input: {
     const args = parseSearchWorkspaceArgs(input.arguments);
     if (!args) {
       return formatToolErrorResult(
-        "search_workspace arguments must include query, mode, and optional glob/caseSensitive/maxResults fields.",
+        "search_workspace arguments must include query and mode.",
       );
     }
     return args.mode === "path"
