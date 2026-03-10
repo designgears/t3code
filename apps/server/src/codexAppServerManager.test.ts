@@ -7,6 +7,7 @@ import { ApprovalRequestId, ThreadId } from "@t3tools/contracts";
 
 import {
   buildCodexInitializeParams,
+  buildCodexThreadStartParams,
   CODEX_DEFAULT_MODE_DEVELOPER_INSTRUCTIONS,
   CODEX_PLAN_MODE_DEVELOPER_INSTRUCTIONS,
   CodexAppServerManager,
@@ -281,6 +282,35 @@ describe("startSession", () => {
         experimentalApi: true,
       },
     });
+  });
+
+  it("registers dynamic tools on thread/start", () => {
+    expect(
+      buildCodexThreadStartParams({
+        sessionOverrides: {
+          model: "gpt-5.3-codex",
+          cwd: "/tmp/workspace",
+          approvalPolicy: "never",
+          sandbox: "danger-full-access",
+        },
+      }),
+    ).toEqual(
+      expect.objectContaining({
+        model: "gpt-5.3-codex",
+        cwd: "/tmp/workspace",
+        dynamicTools: expect.arrayContaining([
+          expect.objectContaining({ name: "search_workspace" }),
+          expect.objectContaining({ name: "read_files" }),
+          expect.objectContaining({ name: "find_symbols" }),
+          expect.objectContaining({ name: "find_exported_api" }),
+          expect.objectContaining({ name: "find_references" }),
+          expect.objectContaining({ name: "find_text_with_context" }),
+          expect.objectContaining({ name: "list_directory" }),
+          expect.objectContaining({ name: "stat_files" }),
+        ]),
+        experimentalRawEvents: false,
+      }),
+    );
   });
 
   it("emits session/startFailed when resolving cwd throws before process launch", async () => {
@@ -745,6 +775,85 @@ describe("respondToUserInput", () => {
     const request = Array.from(context.pendingApprovals.values())[0];
     expect(request?.requestKind).toBe("file-read");
     expect(request?.method).toBe("item/fileRead/requestApproval");
+  });
+
+  it("responds to dynamic tool calls with batched workspace results", async () => {
+    const workspaceDir = mkdtempSync(path.join(os.tmpdir(), "codex-dynamic-tool-call-"));
+    writeFileSync(path.join(workspaceDir, "auth.ts"), "export const auth = true;\n", "utf8");
+
+    const manager = new CodexAppServerManager();
+    type DynamicToolRequestContext = {
+      session: {
+        sessionId: string;
+        provider: "codex";
+        status: "ready";
+        threadId: ThreadId;
+        resumeCursor: { threadId: string };
+        cwd: string;
+        createdAt: string;
+        updatedAt: string;
+      };
+      pendingApprovals: Map<unknown, unknown>;
+      pendingUserInputs: Map<unknown, unknown>;
+    };
+    const context = {
+      session: {
+        sessionId: "sess_1",
+        provider: "codex",
+        status: "ready",
+        threadId: asThreadId("thread_1"),
+        resumeCursor: { threadId: "thread_1" },
+        cwd: workspaceDir,
+        createdAt: "2026-02-10T00:00:00.000Z",
+        updatedAt: "2026-02-10T00:00:00.000Z",
+      },
+      pendingApprovals: new Map(),
+      pendingUserInputs: new Map(),
+    } satisfies DynamicToolRequestContext;
+    const writeMessage = vi
+      .spyOn(manager as unknown as { writeMessage: (...args: unknown[]) => void }, "writeMessage")
+      .mockImplementation(() => {});
+
+    try {
+      (
+        manager as unknown as {
+          handleServerRequest: (
+            context: DynamicToolRequestContext,
+            request: Record<string, unknown>,
+          ) => void;
+        }
+      ).handleServerRequest(context, {
+        jsonrpc: "2.0",
+        id: 42,
+        method: "item/tool/call",
+        params: {
+          tool: "search_workspace",
+          arguments: {
+            query: "auth",
+            mode: "path",
+          },
+        },
+      });
+
+      await vi.waitFor(() => {
+        expect(writeMessage).toHaveBeenCalledWith(
+          context,
+          expect.objectContaining({
+            id: 42,
+            result: expect.objectContaining({
+              contentItems: [
+                expect.objectContaining({
+                  text: expect.stringContaining("./auth.ts"),
+                }),
+              ],
+              success: true,
+            }),
+          }),
+        );
+      });
+    } finally {
+      rmSync(workspaceDir, { recursive: true, force: true });
+    }
   });
 });
 

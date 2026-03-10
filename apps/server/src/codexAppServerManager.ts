@@ -27,6 +27,11 @@ import {
   isCodexCliVersionSupported,
   parseCodexCliVersion,
 } from "./provider/codexCliVersion";
+import {
+  buildCodexDynamicToolSpecs,
+  CODEX_DYNAMIC_TOOL_DEVELOPER_INSTRUCTIONS,
+  executeCodexDynamicTool,
+} from "./codexDynamicTools";
 
 type PendingRequestKey = string;
 
@@ -205,7 +210,7 @@ export function readCodexAccountSnapshot(response: unknown): CodexAccountSnapsho
   };
 }
 
-export const CODEX_PLAN_MODE_DEVELOPER_INSTRUCTIONS = `<collaboration_mode># Plan Mode (Conversational)
+const CODEX_PLAN_MODE_COLLABORATION_INSTRUCTIONS = `<collaboration_mode># Plan Mode (Conversational)
 
 You work in 3 phases, and you should *chat your way* to a great plan before finalizing it. A great plan is very detailed-intent- and implementation-wise-so that it can be handed to another engineer or agent to be implemented right away. It must be **decision complete**, where the implementer does not need to make any decisions.
 
@@ -327,7 +332,7 @@ Do not ask "should I proceed?" in the final output. The user can easily switch o
 Only produce at most one \`<proposed_plan>\` block per turn, and only when you are presenting a complete spec.
 </collaboration_mode>`;
 
-export const CODEX_DEFAULT_MODE_DEVELOPER_INSTRUCTIONS = `<collaboration_mode># Collaboration Mode: Default
+const CODEX_DEFAULT_MODE_COLLABORATION_INSTRUCTIONS = `<collaboration_mode># Collaboration Mode: Default
 
 You are now in Default mode. Any previous instructions for other modes (e.g. Plan mode) are no longer active.
 
@@ -339,6 +344,10 @@ The \`request_user_input\` tool is unavailable in Default mode. If you call it w
 
 In Default mode, strongly prefer making reasonable assumptions and executing the user's request rather than stopping to ask questions. If you absolutely must ask a question because the answer cannot be discovered from local context and a reasonable assumption would be risky, ask the user directly with a concise plain-text question. Never write a multiple choice question as a textual assistant message.
 </collaboration_mode>`;
+
+export const CODEX_PLAN_MODE_DEVELOPER_INSTRUCTIONS = `${CODEX_PLAN_MODE_COLLABORATION_INSTRUCTIONS}\n\n${CODEX_DYNAMIC_TOOL_DEVELOPER_INSTRUCTIONS}`;
+
+export const CODEX_DEFAULT_MODE_DEVELOPER_INSTRUCTIONS = `${CODEX_DEFAULT_MODE_COLLABORATION_INSTRUCTIONS}\n\n${CODEX_DYNAMIC_TOOL_DEVELOPER_INSTRUCTIONS}`;
 
 function mapCodexRuntimeMode(runtimeMode: RuntimeMode): {
   readonly approvalPolicy: "on-request" | "never";
@@ -411,6 +420,22 @@ export function buildCodexInitializeParams() {
     capabilities: {
       experimentalApi: true,
     },
+  } as const;
+}
+
+export function buildCodexThreadStartParams(input: {
+  readonly sessionOverrides: {
+    readonly model: string | null;
+    readonly serviceTier?: string;
+    readonly cwd: string | null;
+    readonly approvalPolicy: "on-request" | "never";
+    readonly sandbox: "workspace-write" | "danger-full-access";
+  };
+}) {
+  return {
+    ...input.sessionOverrides,
+    dynamicTools: buildCodexDynamicToolSpecs(),
+    experimentalRawEvents: false,
   } as const;
 }
 
@@ -584,22 +609,10 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
 
       this.writeMessage(context, { method: "initialized" });
       try {
-        const modelListResponse = await this.sendRequest(context, "model/list", {});
-        console.log("codex model/list response", modelListResponse);
-      } catch (error) {
-        console.log("codex model/list failed", error);
-      }
-      try {
         const accountReadResponse = await this.sendRequest(context, "account/read", {});
-        console.log("codex account/read response", accountReadResponse);
         context.account = readCodexAccountSnapshot(accountReadResponse);
-        console.log("codex subscription status", {
-          type: context.account.type,
-          planType: context.account.planType,
-          sparkEnabled: context.account.sparkEnabled,
-        });
-      } catch (error) {
-        console.log("codex account/read failed", error);
+      } catch {
+        // Keep the optimistic default snapshot if account data is unavailable.
       }
 
       const normalizedModel = resolveCodexModelForAccount(
@@ -613,10 +626,9 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
         ...mapCodexRuntimeMode(input.runtimeMode ?? "full-access"),
       };
 
-      const threadStartParams = {
-        ...sessionOverrides,
-        experimentalRawEvents: false,
-      };
+      const threadStartParams = buildCodexThreadStartParams({
+        sessionOverrides,
+      });
       const resumeThreadId = readResumeThreadId(input);
       this.emitLifecycleEvent(
         context,
@@ -1238,6 +1250,11 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
       return;
     }
 
+    if (request.method === "item/tool/call") {
+      void this.handleDynamicToolCall(context, request);
+      return;
+    }
+
     this.writeMessage(context, {
       id: request.id,
       error: {
@@ -1263,6 +1280,42 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
     }
 
     pending.resolve(response.result);
+  }
+
+  private async handleDynamicToolCall(
+    context: CodexSessionContext,
+    request: JsonRpcRequest,
+  ): Promise<void> {
+    const params = this.readObject(request.params);
+    const tool = this.readString(params, "tool");
+    const args = params?.arguments;
+    const toolResult = await executeCodexDynamicTool({
+      cwd: context.session.cwd ?? process.cwd(),
+      tool: tool ?? "",
+      arguments: args,
+    }).catch((error) =>
+      ({
+        content: [
+          {
+            type: "input_text" as const,
+            text: error instanceof Error ? error.message : String(error),
+          },
+        ],
+        isError: true,
+      }) satisfies Awaited<ReturnType<typeof executeCodexDynamicTool>>,
+    );
+    const result = {
+      contentItems: toolResult.content.map((item) => ({
+        type: "inputText" as const,
+        text: item.text,
+      })),
+      success: !toolResult.isError,
+    };
+
+    this.writeMessage(context, {
+      id: request.id,
+      result,
+    });
   }
 
   private async sendRequest<TResponse>(
