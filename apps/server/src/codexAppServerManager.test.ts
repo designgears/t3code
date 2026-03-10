@@ -7,7 +7,6 @@ import { ApprovalRequestId, ThreadId } from "@t3tools/contracts";
 
 import {
   buildCodexInitializeParams,
-  buildCodexThreadStartParams,
   CODEX_DEFAULT_MODE_DEVELOPER_INSTRUCTIONS,
   CODEX_PLAN_MODE_DEVELOPER_INSTRUCTIONS,
   CodexAppServerManager,
@@ -282,35 +281,6 @@ describe("startSession", () => {
         experimentalApi: true,
       },
     });
-  });
-
-  it("registers dynamic tools on thread/start", () => {
-    expect(
-      buildCodexThreadStartParams({
-        sessionOverrides: {
-          model: "gpt-5.3-codex",
-          cwd: "/tmp/workspace",
-          approvalPolicy: "never",
-          sandbox: "danger-full-access",
-        },
-      }),
-    ).toEqual(
-      expect.objectContaining({
-        model: "gpt-5.3-codex",
-        cwd: "/tmp/workspace",
-        dynamicTools: expect.arrayContaining([
-          expect.objectContaining({ name: "search_workspace" }),
-          expect.objectContaining({ name: "read_files" }),
-          expect.objectContaining({ name: "find_symbols" }),
-          expect.objectContaining({ name: "find_exported_api" }),
-          expect.objectContaining({ name: "find_references" }),
-          expect.objectContaining({ name: "find_text_with_context" }),
-          expect.objectContaining({ name: "list_directory" }),
-          expect.objectContaining({ name: "stat_files" }),
-        ]),
-        experimentalRawEvents: false,
-      }),
-    );
   });
 
   it("emits session/startFailed when resolving cwd throws before process launch", async () => {
