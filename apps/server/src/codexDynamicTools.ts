@@ -18,7 +18,6 @@ type JsonSchema = Record<string, unknown>;
 
 export interface CodexDynamicToolResult {
   readonly content: ReadonlyArray<DynamicToolTextContent>;
-  readonly structuredContent?: Record<string, unknown>;
   readonly isError?: boolean;
 }
 
@@ -183,24 +182,16 @@ function normalizeDisplayPath(value: string): string {
   return normalized;
 }
 
-function formatToolTextResult(
-  text: string,
-  structuredContent?: Record<string, unknown>,
-): CodexDynamicToolResult {
+function formatToolTextResult(text: string): CodexDynamicToolResult {
   return {
     content: [{ type: "input_text", text }],
-    ...(structuredContent ? { structuredContent } : {}),
   };
 }
 
-function formatToolErrorResult(
-  text: string,
-  structuredContent?: Record<string, unknown>,
-): CodexDynamicToolResult {
+function formatToolErrorResult(text: string): CodexDynamicToolResult {
   return {
     content: [{ type: "input_text", text }],
     isError: true,
-    ...(structuredContent ? { structuredContent } : {}),
   };
 }
 
@@ -311,10 +302,10 @@ async function searchWorkspacePaths(
     .map((entry) => normalizeDisplayPath(toPosixPath(entry)));
 
   if (matchingPaths.length === 0) {
-    return formatToolTextResult("No path matches found.", { paths: [] });
+    return formatToolTextResult("No path matches found.");
   }
 
-  return formatToolTextResult(matchingPaths.join("\n"), { paths: matchingPaths });
+  return formatToolTextResult(matchingPaths.join("\n"));
 }
 
 async function searchWorkspaceContent(
@@ -363,11 +354,11 @@ async function searchWorkspaceContent(
     .filter((match): match is { path: string; line: number; preview: string } => match !== undefined);
 
   if (matches.length === 0) {
-    return formatToolTextResult("No content matches found.", { matches: [] });
+    return formatToolTextResult("No content matches found.");
   }
 
   const text = matches.map((match) => `${match.path}:${match.line}: ${match.preview}`).join("\n");
-  return formatToolTextResult(text, { matches });
+  return formatToolTextResult(text);
 }
 
 function computeReadWindow(totalLines: number, request: ReadFileRequest): { start: number; end: number } {
@@ -400,7 +391,6 @@ function renderReadSection(lines: ReadonlyArray<string>, start: number): string 
 
 async function readWorkspaceFiles(args: ReadFilesArgs, cwd: string): Promise<CodexDynamicToolResult> {
   const sections: string[] = [];
-  const files: Array<Record<string, unknown>> = [];
 
   for (const request of args.requests) {
     try {
@@ -413,11 +403,6 @@ async function readWorkspaceFiles(args: ReadFilesArgs, cwd: string): Promise<Cod
 
       if (binary) {
         sections.push(`FILE ${workspacePath.displayPath}\nBINARY true\nSIZE_BYTES ${buffer.length}`);
-        files.push({
-          path: workspacePath.displayPath,
-          binary: true,
-          sizeBytes: buffer.length,
-        });
         continue;
       }
 
@@ -439,27 +424,13 @@ async function readWorkspaceFiles(args: ReadFilesArgs, cwd: string): Promise<Cod
           .filter((entry) => entry.length > 0)
           .join("\n"),
       );
-
-      files.push({
-        path: workspacePath.displayPath,
-        binary: false,
-        sizeBytes: buffer.length,
-        totalLines,
-        truncated,
-        startLine: window.start,
-        endLine: window.end,
-      });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       sections.push(`FILE ${request.path}\nERROR ${message}`);
-      files.push({
-        path: request.path,
-        error: message,
-      });
     }
   }
 
-  return formatToolTextResult(sections.join("\n\n"), { files });
+  return formatToolTextResult(sections.join("\n\n"));
 }
 
 export async function executeCodexDynamicTool(input: {
